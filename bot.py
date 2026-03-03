@@ -2,7 +2,7 @@
 🇪🇸 Испания Daily — Telegram-бот с ежедневным дайджестом новостей Испании
 RSS → Claude API (суммаризация + перевод на русский) → Telegram
 
-v5: Улучшенный /start: дайджест → выбор тем → время → закреп меню
+v6: + команда /stats только для админа
 """
 
 import os
@@ -30,6 +30,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TIMEZONE = ZoneInfo("Europe/Madrid")
 DB_PATH = os.environ.get("DB_PATH", "users.db")
 DIGEST_GEN_HOUR = 6
+ADMIN_ID = 8023489016  # Telegram ID админа
 
 # ─── 9 категорий ─────────────────────────────────────────────────────────────
 
@@ -324,7 +325,10 @@ BASE_SYSTEM = """Ты — редактор русскоязычного дайд
 
 ПРАВИЛА:
 - Лаконично! Не лей воду.
-- Свежий, живой русский язык.
+- Свежий, живой, но ГРАМОТНЫЙ русский язык. Никакого сленга, жаргона, панибратства.
+- Тон: профессиональный новостной дайджест с лёгкой подачей. Как хороший журналист, НЕ как блогер.
+- НЕ используй: «земель», «братан», «чел», «кринж», «вайб» и подобный сленг.
+- НЕ обращайся к читателю на «ты». Пиши безлично или на «вы».
 - Поясняй испанские реалии: «Moncloa» → «Монклоа (резиденция премьера)»
 - В конце каждой новости — ссылка: [→ источник](url)
 - НЕ придумывай новости. Только из предоставленных материалов.
@@ -543,6 +547,56 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика — только для админа."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    active = conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1").fetchone()[0]
+    paused = total - active
+
+    # Популярные часы
+    time_rows = conn.execute(
+        "SELECT digest_hour, COUNT(*) as cnt FROM users WHERE is_active = 1 GROUP BY digest_hour ORDER BY cnt DESC LIMIT 5"
+    ).fetchall()
+    top_times = "\n".join(f"  {h:02d}:00 — {c} чел." for h, c in time_rows) if time_rows else "  нет данных"
+
+    # Подписки по категориям
+    sub_rows = conn.execute("SELECT subscriptions FROM users WHERE is_active = 1").fetchall()
+    conn.close()
+
+    cat_count = {k: 0 for k in CATEGORIES}
+    for row in sub_rows:
+        try:
+            subs = json.loads(row[0]) if row[0] else []
+            for s in subs:
+                if s in cat_count:
+                    cat_count[s] += 1
+        except json.JSONDecodeError:
+            pass
+
+    top_cats = "\n".join(
+        f"  {CATEGORIES[k]['emoji']} {CATEGORIES[k]['short']}: {v}"
+        for k, v in sorted(cat_count.items(), key=lambda x: -x[1])
+    )
+
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    cache_ready = "✅ готов" if has_today_digest() else "❌ не готов"
+
+    await update.message.reply_text(
+        f"📊 *Статистика Испания Daily*\n\n"
+        f"👥 Всего пользователей: *{total}*\n"
+        f"✅ Активных: *{active}*\n"
+        f"⏸ На паузе: *{paused}*\n\n"
+        f"📰 *Подписки по темам:*\n{top_cats}\n\n"
+        f"⏰ *Популярные часы:*\n{top_times}\n\n"
+        f"🗓 Дайджест за {today}: {cache_ready}",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE users SET is_active = 0 WHERE chat_id = ?", (update.effective_user.id,))
@@ -723,6 +777,7 @@ def main():
     app.add_handler(CommandHandler("topics", cmd_topics))
     app.add_handler(CommandHandler("time", cmd_time))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CallbackQueryHandler(button_callback))
