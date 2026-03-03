@@ -2,8 +2,7 @@
 🇪🇸 Испания Daily — Telegram-бот с ежедневным дайджестом новостей Испании
 RSS → Claude API (суммаризация + перевод на русский) → Telegram
 
-v4: 9 категорий с подпиской. Дайджест генерируется 1 раз в день,
-    каждый пользователь получает только выбранные разделы.
+v5: Улучшенный /start: дайджест → выбор тем → время → закреп меню
 """
 
 import os
@@ -30,7 +29,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TIMEZONE = ZoneInfo("Europe/Madrid")
 DB_PATH = os.environ.get("DB_PATH", "users.db")
-DIGEST_GEN_HOUR = 6  # Генерация в 06:00 по Мадриду
+DIGEST_GEN_HOUR = 6
 
 # ─── 9 категорий ─────────────────────────────────────────────────────────────
 
@@ -48,7 +47,7 @@ CATEGORIES = {
 
 ALL_CATEGORY_KEYS = list(CATEGORIES.keys())
 
-# ─── RSS-источники по категориям ─────────────────────────────────────────────
+# ─── RSS-источники ───────────────────────────────────────────────────────────
 
 RSS_FEEDS = [
     # 1️⃣ Политика
@@ -69,7 +68,7 @@ RSS_FEEDS = [
     ("El País — Educación", "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/educacion/portada", "society"),
     ("El País — Salud", "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/salud/portada", "society"),
 
-    # 4️⃣ Локальные: Барселона / Мадрид
+    # 4️⃣ Локальные
     ("El País — Madrid", "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/madrid/portada", "local"),
     ("El País — Catalunya", "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/catalunya/portada", "local"),
     ("20 Minutos — Madrid", "https://www.20minutos.es/rss/madrid/", "local"),
@@ -93,7 +92,7 @@ RSS_FEEDS = [
     ("20 Minutos — Gente", "https://www.20minutos.es/rss/gente/", "celebrities"),
     ("El Mundo — Loc", "https://e00-elmundo.uecdn.es/elmundo/rss/loc.xml", "celebrities"),
 
-    # 9️⃣ Юмор / курьёзы (берём из общества + gente — Claude сам выберет смешное)
+    # 9️⃣ Юмор
     ("20 Minutos — Virales", "https://www.20minutos.es/rss/virales/", "humor"),
     ("El Mundo — Bulos", "https://e00-elmundo.uecdn.es/elmundo/rss/ciencia.xml", "humor"),
 ]
@@ -119,6 +118,7 @@ def init_db():
             digest_minute INTEGER DEFAULT 0,
             subscriptions TEXT DEFAULT '[]',
             is_active INTEGER DEFAULT 1,
+            onboarding_done INTEGER DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -179,7 +179,6 @@ def set_user_subs(chat_id: int, subs: list[str]):
 
 
 def toggle_user_sub(chat_id: int, category: str) -> list[str]:
-    """Переключить подписку. Возвращает обновлённый список."""
     subs = get_user_subs(chat_id)
     if category in subs:
         subs.remove(category)
@@ -189,8 +188,14 @@ def toggle_user_sub(chat_id: int, category: str) -> list[str]:
     return subs
 
 
+def set_onboarding_done(chat_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE users SET onboarding_done = 1 WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
 def get_users_for_hour(hour: int, minute: int = 0) -> list[tuple[int, list[str]]]:
-    """Получить (chat_id, subscriptions) для данного времени."""
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         "SELECT chat_id, subscriptions FROM users WHERE digest_hour = ? AND digest_minute = ? AND is_active = 1",
@@ -220,15 +225,6 @@ def save_category_digest(date_str: str, category: str, text: str):
     conn.close()
 
 
-def get_category_digest(date_str: str, category: str) -> str | None:
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT digest_text FROM digest_cache WHERE date = ? AND category = ?", (date_str, category)
-    ).fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
 def get_all_cached_categories(date_str: str) -> dict[str, str]:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("SELECT category, digest_text FROM digest_cache WHERE date = ?", (date_str,)).fetchall()
@@ -255,7 +251,6 @@ def cleanup_old_cache():
 
 
 def fetch_news_by_category() -> dict[str, str]:
-    """Собрать новости, сгруппированные по категориям."""
     news_by_cat: dict[str, list[str]] = {k: [] for k in CATEGORIES}
 
     for feed_name, feed_url, category in RSS_FEEDS:
@@ -339,10 +334,8 @@ BASE_SYSTEM = """Ты — редактор русскоязычного дайд
 
 
 async def generate_category_digest(category: str, news_text: str) -> str:
-    """Сгенерировать дайджест для одной категории."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     today = datetime.now(TIMEZONE).strftime("%d %B %Y")
-
     cat_prompt = CATEGORY_PROMPTS.get(category, "")
 
     message = client.messages.create(
@@ -352,8 +345,7 @@ async def generate_category_digest(category: str, news_text: str) -> str:
         messages=[{
             "role": "user",
             "content": (
-                f"Дата: {today}\n\n"
-                f"{cat_prompt}\n\n"
+                f"Дата: {today}\n\n{cat_prompt}\n\n"
                 f"Новости на испанском:\n\n{news_text}\n\n"
                 "Создай раздел дайджеста на русском. Только этот раздел, без заголовка дня."
             ),
@@ -363,11 +355,10 @@ async def generate_category_digest(category: str, news_text: str) -> str:
 
 
 async def generate_all_digests():
-    """Сгенерировать дайджесты по всем 9 категориям и закешировать."""
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
 
     if has_today_digest():
-        logger.info(f"📦 Дайджест за {today} уже есть в кеше")
+        logger.info(f"📦 Дайджест за {today} уже есть")
         return
 
     logger.info(f"🔄 Генерирую дайджесты за {today}...")
@@ -392,7 +383,6 @@ async def generate_all_digests():
 
 
 def build_personal_digest(subs: list[str]) -> str:
-    """Собрать персональный дайджест из кешированных категорий."""
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     today_display = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
     cached = get_all_cached_categories(today)
@@ -401,33 +391,34 @@ def build_personal_digest(subs: list[str]) -> str:
         return "😔 Дайджест ещё не готов. Попробуй чуть позже!"
 
     parts = [f"☀️ *Испания Daily* — {today_display}\n"]
-
     for cat_key in ALL_CATEGORY_KEYS:
         if cat_key in subs and cat_key in cached:
             parts.append(cached[cat_key])
-            parts.append("")  # пустая строка между разделами
+            parts.append("")
 
     parts.append("Хорошего дня! 🇪🇸")
-
     return "\n".join(parts)
+
+
+def build_full_digest() -> str:
+    """Полный дайджест со всеми 9 категориями (для /start)."""
+    return build_personal_digest(ALL_CATEGORY_KEYS)
 
 
 # ─── Отправка ────────────────────────────────────────────────────────────────
 
 
-async def send_personal_digest(chat_id: int, subs: list[str], context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def send_digest_message(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
-        digest = build_personal_digest(subs)
-
-        if len(digest) > 4096:
-            parts = [digest[i : i + 4096] for i in range(0, len(digest), 4096)]
+        if len(text) > 4096:
+            parts = [text[i : i + 4096] for i in range(0, len(text), 4096)]
             for part in parts:
                 await context.bot.send_message(
                     chat_id=chat_id, text=part, parse_mode="Markdown", disable_web_page_preview=True
                 )
         else:
             await context.bot.send_message(
-                chat_id=chat_id, text=digest, parse_mode="Markdown", disable_web_page_preview=True
+                chat_id=chat_id, text=text, parse_mode="Markdown", disable_web_page_preview=True
             )
         return True
     except Exception as e:
@@ -435,22 +426,59 @@ async def send_personal_digest(chat_id: int, subs: list[str], context: ContextTy
         return False
 
 
+# ─── Закреплённое меню ───────────────────────────────────────────────────────
+
+MENU_TEXT = (
+    "📌 *Меню Испания Daily*\n\n"
+    "📰 /topics — Выбрать темы\n"
+    "⏰ /time — Изменить время\n"
+    "⏸ /stop — Пауза\n"
+    "▶️ /resume — Возобновить\n"
+    "📖 /help — Справка"
+)
+
+
+async def send_and_pin_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Отправить меню и попробовать закрепить."""
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=MENU_TEXT,
+        parse_mode="Markdown",
+    )
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось закрепить меню для {chat_id}: {e}")
+
+
 # ─── Telegram-команды ────────────────────────────────────────────────────────
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Поток /start:
+    1. Приветствие
+    2. Полный дайджест (все 9 категорий)
+    3. Выбор тем
+    4. Выбор времени
+    5. Закреплённое меню
+    """
     user = update.effective_user
     upsert_user(user.id, user.username or user.first_name)
+    chat_id = update.effective_chat.id
 
+    # 1. Приветствие
     if has_today_digest():
         await update.message.reply_text(
             f"👋 Привет, {user.first_name}!\n"
             "Я — *Испания Daily* 🇪🇸\n\n"
-            "Вот сегодняшний дайджест:",
+            "Вот все новости Испании за сегодня:",
             parse_mode="Markdown",
         )
-        subs = get_user_subs(user.id)
-        await send_personal_digest(update.effective_chat.id, subs, context)
     else:
         await update.message.reply_text(
             f"👋 Привет, {user.first_name}!\n"
@@ -459,23 +487,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         await generate_all_digests()
-        subs = get_user_subs(user.id)
-        await send_personal_digest(update.effective_chat.id, subs, context)
 
-    await update.message.reply_text(
-        "📅 Теперь настрой бота:\n"
-        "⏰ /time — выбрать время дайджеста\n"
-        "📰 /topics — выбрать темы\n"
-        "📖 /help — все команды",
+    # 2. Полный дайджест (все 9 категорий)
+    full_digest = build_full_digest()
+    await send_digest_message(chat_id, full_digest, context)
+
+    # 3. Выбор тем
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "👆 Это был полный дайджест из 9 разделов.\n\n"
+            "📰 *Теперь выбери, какие темы получать ежедневно:*\n"
+            "Нажми на тему чтобы включить/выключить.\n"
+            "По умолчанию — все включены."
+        ),
         parse_mode="Markdown",
+        reply_markup=build_topics_keyboard(user.id),
     )
+
+    # Сохраняем в context что пользователь в процессе онбординга
+    context.user_data["onboarding"] = True
 
 
 async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать меню выбора категорий."""
     await update.message.reply_text(
-        "📰 *Выбери темы для дайджеста*\n"
-        "Нажми на тему чтобы включить/выключить:\n"
+        "📰 *Темы дайджеста*\n"
         "✅ = подписан  |  ❌ = выключено",
         parse_mode="Markdown",
         reply_markup=build_topics_keyboard(update.effective_user.id),
@@ -485,7 +521,7 @@ async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hour, minute = get_user_time(update.effective_user.id)
     await update.message.reply_text(
-        f"⏰ Сейчас дайджест приходит в *{hour:02d}:{minute:02d}* (Мадрид)\n\nВыбери новое время 👇",
+        f"⏰ Сейчас: *{hour:02d}:{minute:02d}* (Мадрид)\nВыбери новое время 👇",
         parse_mode="Markdown",
         reply_markup=build_time_keyboard(),
     )
@@ -499,7 +535,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/time — Изменить время дайджеста\n"
         "/stop — Приостановить рассылку\n"
         "/resume — Возобновить рассылку\n"
-        "/help — Эта справка",
+        "/help — Эта справка\n\n"
+        "📰 *9 разделов:*\n"
+        "Политика • Экономика • Общество • Регионы\n"
+        "Происшествия • Спорт • Культура • Знаменитости • Юмор",
         parse_mode="Markdown",
     )
 
@@ -536,8 +575,10 @@ def build_topics_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             f"{status} {info['emoji']} {info['name']}",
             callback_data=f"topic_{key}"
         )])
-    keyboard.append([InlineKeyboardButton("✅ Подписаться на ВСЕ", callback_data="topic_all")])
-    keyboard.append([InlineKeyboardButton("❌ Отписаться от ВСЕХ", callback_data="topic_none")])
+    keyboard.append([
+        InlineKeyboardButton("✅ Все", callback_data="topic_all"),
+        InlineKeyboardButton("❌ Сброс", callback_data="topic_none"),
+    ])
     keyboard.append([InlineKeyboardButton("👌 Готово", callback_data="topic_done")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -570,18 +611,39 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     chat_id = query.from_user.id
+    is_onboarding = context.user_data.get("onboarding", False)
 
-    # Время
+    # ── Время ──
     if data.startswith("time_"):
         parts = data.split("_")
         hour, minute = int(parts[1]), int(parts[2])
         set_user_time(chat_id, hour, minute)
-        await query.edit_message_text(
-            f"✅ Дайджест каждый день в *{hour:02d}:{minute:02d}* (Мадрид)\n\n/time — изменить  |  /topics — темы",
-            parse_mode="Markdown",
-        )
 
-    # Темы
+        if is_onboarding:
+            # Онбординг завершён → закрепляем меню
+            context.user_data["onboarding"] = False
+            set_onboarding_done(chat_id)
+
+            subs = get_user_subs(chat_id)
+            count = len(subs)
+
+            await query.edit_message_text(
+                f"🎉 *Всё готово!*\n\n"
+                f"📰 Подписка: {count} из 9 тем\n"
+                f"⏰ Время: *{hour:02d}:{minute:02d}* (Мадрид)\n\n"
+                "Завтра в это время получишь свой первый автоматический дайджест!",
+                parse_mode="Markdown",
+            )
+
+            # Закрепляем меню
+            await send_and_pin_menu(chat_id, context)
+        else:
+            await query.edit_message_text(
+                f"✅ Дайджест каждый день в *{hour:02d}:{minute:02d}* (Мадрид)",
+                parse_mode="Markdown",
+            )
+
+    # ── Темы ──
     elif data.startswith("topic_"):
         action = data.replace("topic_", "")
 
@@ -589,28 +651,40 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             subs = get_user_subs(chat_id)
             count = len(subs)
             names = ", ".join(CATEGORIES[s]["short"] for s in ALL_CATEGORY_KEYS if s in subs)
-            await query.edit_message_text(
-                f"✅ Подписка настроена! ({count} из 9)\n\n📰 {names}\n\n/topics — изменить",
-                parse_mode="Markdown",
-            )
+
+            if is_onboarding:
+                # Переходим к выбору времени
+                await query.edit_message_text(
+                    f"✅ Выбрано тем: {count} из 9\n"
+                    f"📰 {names}\n\n"
+                    "⏰ *Теперь выбери время дайджеста* (по Мадриду):",
+                    parse_mode="Markdown",
+                    reply_markup=build_time_keyboard(),
+                )
+            else:
+                await query.edit_message_text(
+                    f"✅ Подписка обновлена! ({count} из 9)\n📰 {names}",
+                    parse_mode="Markdown",
+                )
+
         elif action == "all":
             set_user_subs(chat_id, ALL_CATEGORY_KEYS.copy())
             await query.edit_message_text(
-                "📰 *Выбери темы для дайджеста*\nНажми на тему чтобы включить/выключить:\n✅ = подписан  |  ❌ = выключено",
+                "📰 *Темы дайджеста*\n✅ = подписан  |  ❌ = выключено",
                 parse_mode="Markdown",
                 reply_markup=build_topics_keyboard(chat_id),
             )
         elif action == "none":
             set_user_subs(chat_id, [])
             await query.edit_message_text(
-                "📰 *Выбери темы для дайджеста*\nНажми на тему чтобы включить/выключить:\n✅ = подписан  |  ❌ = выключено",
+                "📰 *Темы дайджеста*\n✅ = подписан  |  ❌ = выключено",
                 parse_mode="Markdown",
                 reply_markup=build_topics_keyboard(chat_id),
             )
         else:
             toggle_user_sub(chat_id, action)
             await query.edit_message_text(
-                "📰 *Выбери темы для дайджеста*\nНажми на тему чтобы включить/выключить:\n✅ = подписан  |  ❌ = выключено",
+                "📰 *Темы дайджеста*\n✅ = подписан  |  ❌ = выключено",
                 parse_mode="Markdown",
                 reply_markup=build_topics_keyboard(chat_id),
             )
@@ -620,14 +694,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_generate(context: ContextTypes.DEFAULT_TYPE):
-    """В 06:00 — генерируем все дайджесты."""
     now = datetime.now(TIMEZONE)
     if now.hour == DIGEST_GEN_HOUR and now.minute == 0:
         await generate_all_digests()
 
 
 async def job_send(context: ContextTypes.DEFAULT_TYPE):
-    """Каждую минуту — рассылаем кому положено."""
     now = datetime.now(TIMEZONE)
     users = get_users_for_hour(now.hour, now.minute)
     if not users:
@@ -636,7 +708,8 @@ async def job_send(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"⏰ {now.strftime('%H:%M')} — рассылка {len(users)} пользователям")
     for chat_id, subs in users:
         if subs:
-            await send_personal_digest(chat_id, subs, context)
+            digest = build_personal_digest(subs)
+            await send_digest_message(chat_id, digest, context)
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
